@@ -124,16 +124,12 @@ export default function CameraScreen() {
     }
   }, []);
 
-  // ---- Captura y envío ----
-  const captureAndSend = useCallback(async () => {
-    if (!cameraRef.current || sendingRef.current) return;
+  // ---- WebSockets: Streaming continuo ----
+  const wsRef = useRef<WebSocket | null>(null);
 
-    sendingRef.current = true;
+  const captureAndSendWS = useCallback(async (ws: WebSocket) => {
+    if (!cameraRef.current || ws.readyState !== WebSocket.OPEN) return;
     try {
-      setIsSending(true);
-      setError(null);
-
-      // Capturar foto (sin sonido ni procesamiento extra: más rápido)
       const photo = await cameraRef.current.takePictureAsync({
         quality: CONFIG.JPEG_QUALITY,
         base64: true,
@@ -141,52 +137,89 @@ export default function CameraScreen() {
         shutterSound: false,
       });
 
-      if (!photo?.base64) {
-        throw new Error("No se pudo capturar la imagen");
+      if (photo?.base64 && ws.readyState === WebSocket.OPEN) {
+        setCaptureCount((c) => c + 1);
+        ws.send(JSON.stringify({ image: photo.base64 }));
       }
-
-      setCaptureCount((c) => c + 1);
-
-      // Enviar al backend
-      const result = await sendImageForAnalysis(photo.base64);
-      setLastResult(result);
-
     } catch (e: any) {
-      const msg = e.message || "Error desconocido";
-      setError(msg);
-      console.warn("Error en captura:", msg);
-    } finally {
-      sendingRef.current = false;
-      setIsSending(false);
+      console.warn("Error capturando frame WS:", e);
     }
   }, []);
-
-  // ---- Control de monitoreo continuo ----
-  // Bucle en vez de setInterval fijo: la siguiente foto sale apenas termina
-  // el análisis anterior (con un mínimo de CAPTURE_INTERVAL_MS), sin huecos
-  // largos donde un movimiento rápido pasaba sin ser fotografiado.
-  const monitorLoop = useCallback(async (runId: number) => {
-    while (runIdRef.current === runId) {
-      const started = Date.now();
-      await captureAndSend();
-      const wait = CONFIG.CAPTURE_INTERVAL_MS - (Date.now() - started);
-      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
-    }
-  }, [captureAndSend]);
 
   const toggleMonitoring = useCallback(() => {
     runIdRef.current += 1;
     if (isMonitoring) {
-      // Detener (el bucle termina al ver que cambió runId)
+      // Detener
       setIsMonitoring(false);
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+      }
     } else {
       // Iniciar
       setIsMonitoring(true);
       setCaptureCount(0);
       setLastResult(null);
-      monitorLoop(runIdRef.current);
+      setError(null);
+
+      // Usar ws:// o wss:// dependiendo de CONFIG.BACKEND_URL
+      const wsUrl = CONFIG.BACKEND_URL.replace(/^http/, "ws") + "/ws/analyze";
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        captureAndSendWS(ws);
+      };
+
+      ws.onmessage = (e) => {
+        try {
+          const result = JSON.parse(e.data);
+          setLastResult(result);
+        } catch (err) {}
+        
+        // Esperar el intervalo y mandar el siguiente frame si seguimos monitoreando
+        setTimeout(() => {
+          if (wsRef.current === ws) {
+            captureAndSendWS(ws);
+          }
+        }, CONFIG.CAPTURE_INTERVAL_MS);
+      };
+
+      ws.onerror = (e) => {
+        setError("Error de conexión WebSocket");
+      };
+
+      ws.onclose = () => {
+        setIsMonitoring(false);
+        wsRef.current = null;
+      };
     }
-  }, [isMonitoring, monitorLoop]);
+  }, [isMonitoring, captureAndSendWS]);
+
+  // ---- Captura manual aislada (vía HTTP POST) ----
+  const captureManual = useCallback(async () => {
+    if (!cameraRef.current) return;
+    try {
+      setIsSending(true);
+      setError(null);
+      const photo = await cameraRef.current.takePictureAsync({
+        quality: CONFIG.JPEG_QUALITY,
+        base64: true,
+        skipProcessing: true,
+        shutterSound: false,
+      });
+
+      if (photo?.base64) {
+        const result = await sendImageForAnalysis(photo.base64);
+        setLastResult(result);
+        setCaptureCount((c) => c + 1);
+      }
+    } catch (e: any) {
+      setError(e.message || "Error manual");
+    } finally {
+      setIsSending(false);
+    }
+  }, []);
 
   // Cambiar de cámara: la escena es otra, así que se pide nueva referencia
   const flipCamera = useCallback(() => {
@@ -348,7 +381,7 @@ export default function CameraScreen() {
           {/* Captura manual */}
           <TouchableOpacity
             style={[styles.secondaryBtn]}
-            onPress={captureAndSend}
+            onPress={captureManual}
             disabled={isSending || isMonitoring}
           >
             <Ionicons name="camera" size={20} color={COLORS.primary} />

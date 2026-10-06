@@ -16,6 +16,7 @@ import json
 import base64
 import smtplib
 import logging
+import asyncio
 from io import BytesIO
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -27,7 +28,7 @@ import cv2
 import httpx
 import numpy as np
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
@@ -518,6 +519,89 @@ async def analyze_image(payload: ImagePayload, background_tasks: BackgroundTasks
         cooldown_active=cooldown,
         message=message,
     )
+
+
+@app.websocket("/ws/analyze")
+async def websocket_analyze(websocket: WebSocket):
+    """
+    Endpoint de streaming de video por WebSockets.
+    El cliente abre la conexión y manda frames en tiempo real de forma bidireccional.
+    """
+    await websocket.accept()
+    logger.info("🔌 Cliente WebSocket conectado para streaming de video")
+    
+    try:
+        while True:
+            # Recibimos el frame codificado en JSON
+            data = await websocket.receive_json()
+            base64_img = data.get("image")
+            if not base64_img:
+                continue
+
+            try:
+                img_bytes = base64.b64decode(base64_img)
+                img_array = np.frombuffer(img_bytes, dtype=np.uint8)
+                frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+                if frame is None:
+                    continue
+            except Exception:
+                continue
+
+            # Lógica idéntica al endpoint POST /analyze
+            h, w = frame.shape[:2]
+            if w > 320:
+                frame = cv2.resize(frame, (320, round(h * 320 / w)), interpolation=cv2.INTER_AREA)
+
+            state.total_analyses += 1
+            detected, diff_pct, changed, total = detect_motion(frame)
+            state.last_detection_pct = diff_pct
+
+            within_schedule = is_within_schedule()
+            cooldown = is_cooldown_active()
+            alarm_triggered = False
+            message = "Sin movimiento"
+
+            if detected and state.detection_active:
+                if not within_schedule:
+                    message = "Movimiento detectado pero FUERA de franja horaria"
+                    # Opcional: descomentar para debugear, pero en websockets puede spamear logs
+                    # logger.info("⏰ %s (%.1f%%)", message, diff_pct)
+
+                elif cooldown:
+                    remaining = COOLDOWN_SECONDS - (datetime.now() - state.last_alert_time).seconds
+                    message = f"Movimiento detectado pero en cooldown ({remaining}s restantes)"
+                    
+                else:
+                    state.total_detections += 1
+                    state.last_alert_time = datetime.now()
+                    alarm_triggered = True
+                    message = f"🚨 INTRUSO DETECTADO ({diff_pct:.1f}% cambio)"
+
+                    logger.warning("🚨 MOVIMIENTO #%d | %.1f%% | Disparando acciones (vía WS)...",
+                                   state.total_detections, diff_pct)
+
+                    # Hilos en background usando asyncio
+                    asyncio.create_task(log_to_supabase(diff_pct, changed))
+                    
+                    loop = asyncio.get_running_loop()
+                    loop.run_in_executor(None, send_alert_email, diff_pct, img_bytes)
+
+            # Devolvemos el resultado por el mismo WebSocket en tiempo real
+            await websocket.send_json({
+                "motion_detected": detected,
+                "diff_percentage": diff_pct,
+                "changed_pixels": changed,
+                "total_pixels": total,
+                "alarm_triggered": alarm_triggered,
+                "within_schedule": within_schedule,
+                "cooldown_active": cooldown,
+                "message": message,
+            })
+
+    except WebSocketDisconnect:
+        logger.info("🔌 Cliente WebSocket desconectado")
+    except Exception as e:
+        logger.error("⚠ Error en WebSocket: %s", e)
 
 
 @app.get("/status")
