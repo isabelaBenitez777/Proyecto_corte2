@@ -1,0 +1,19 @@
+# Entornos virtuales y secretos
+.env
+__pycache__/
+*.pyc
+
+# ESP32 Secrets
+esp32/config.h
+esp32/main/config.h
+
+# Node
+node_modules/
+
+# Expo / React Native
+.expo/
+.expo-shared/
+
+# OS
+.DS_Store
+Thumbs.db
